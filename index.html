@@ -89,7 +89,7 @@
   <div class="card">
     <h1>Log temperatury z QR</h1>
     <div class="info-row small">
-      Dane są przesyłane w formacie binarnym (1 próbka na godzinę, T1/T2 zaokrąglone do 1&nbsp;°C).
+      Dane są przesyłane w formacie binarnym (stała siatka czasowa, T1/T2 zaokrąglone do 1&nbsp;°C).
     </div>
   </div>
 
@@ -179,6 +179,7 @@
     return bytes;
   }
 
+  // NOWA wersja – stała siatka slotów: po nagłówku same pary [T1enc, T2enc]
   function decodePayload(bytes) {
     if (!bytes || bytes.length < 4) {
       throw new Error('Za mało danych (nagłówek krótszy niż 4 bajty).');
@@ -193,27 +194,33 @@
     if (intervalMin === 0) {
       throw new Error('Interwał = 0 w nagłówku.');
     }
-    if (60 % intervalMin !== 0) {
-      throw new Error('Interwał z nagłówka nie dzieli 60.');
+    if (60 % intervalMin !== 0 || 1440 % intervalMin !== 0) {
+      throw new Error('Interwał z nagłówka nie dzieli 60/1440.');
     }
 
-    const slotsPerHour = 60 / intervalMin;
+    const totalSlotsPerDay = 1440 / intervalMin;
+    const dataBytes = bytes.length - 4;
+
+    if (dataBytes < totalSlotsPerDay * 2) {
+      throw new Error('Za mało danych w payloadzie względem interwału.');
+    }
+
     const samples = [];
 
-    let i = 4;
-    while (i + 2 < bytes.length) {
-      const slot  = bytes[i++];
-      const t1Enc = bytes[i++];
-      const t2Enc = bytes[i++];
+    // SLOT = indeks (0..slots-1), czas = slot * interwał
+    for (let slot = 0; slot < totalSlotsPerDay; slot++) {
+      const idx = 4 + slot * 2;
+      const t1Enc = bytes[idx];
+      const t2Enc = bytes[idx + 1];
 
-      const totalSlotsPerDay = 1440 / intervalMin;
-      if (slot >= totalSlotsPerDay) {
+      // 0xFF,0xFF = brak danych
+      if (t1Enc === 0xFF && t2Enc === 0xFF) {
         continue;
       }
 
-      const hour   = Math.floor(slot / slotsPerHour);
-      const within = slot % slotsPerHour;
-      const minute = within * intervalMin;
+      const minutes = slot * intervalMin;
+      const hour = Math.floor(minutes / 60);
+      const minute = minutes % 60;
 
       const t1 = t1Enc - 40;
       const t2 = t2Enc - 40;
