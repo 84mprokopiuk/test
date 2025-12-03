@@ -89,14 +89,16 @@
   <div class="card">
     <h1>Log temperatury z QR</h1>
     <div class="info-row small">
-      Dane są przesyłane w formacie binarnym (stała siatka czasowa, T1/T2 zaokrąglone do 1&nbsp;°C).
+      Dane są przesyłane w formacie binarnym.
+      Aktualnie QR zawiera T1 w równych odstępach czasu (np. co 15 minut).
+      Miejsce na T2 jest przygotowane na przyszłość.
     </div>
   </div>
 
   <div class="card">
     <h2>Źródło danych</h2>
     <div class="controls">
-      <input id="hashInput" type="text" placeholder="#b=..." />
+      <input id="hashInput" type="text" placeholder="#b=...&r=..." />
       <button id="btnLoadHash">Załaduj z pola</button>
     </div>
     <div class="small">
@@ -110,7 +112,7 @@
     <h2>Informacje o logu</h2>
     <div class="info-row"><span class="info-label">Data:</span> <span id="infoDate">–</span></div>
     <div class="info-row"><span class="info-label">Rejestracja:</span> <span id="infoRej">–</span></div>
-    <div class="info-row"><span class="info-label">Interwał oryginalnego logu:</span> <span id="infoInterval">–</span></div>
+    <div class="info-row"><span class="info-label">Interwał logu:</span> <span id="infoInterval">–</span></div>
     <div class="info-row"><span class="info-label">Próbek w QR:</span> <span id="infoSamples">–</span></div>
   </div>
 
@@ -137,7 +139,7 @@
       'Brak danych – zeskanuj QR lub wklej adres z fragmentem <code>#b=...</code>.';
   }
 
-  function getBParamFromHash(rawHash) {
+  function getParamFromHash(rawHash, key) {
     if (!rawHash) return null;
     let h = rawHash;
     if (h.startsWith('#')) h = h.substring(1);
@@ -146,27 +148,19 @@
     const parts = h.split('&');
     for (const part of parts) {
       const [k, v] = part.split('=');
-      if (k === 'b') {
+      if (k === key) {
         return v ? decodeURIComponent(v) : '';
       }
     }
     return null;
   }
 
-  function getRParamFromHash(rawHash) {
-    if (!rawHash) return null;
-    let h = rawHash;
-    if (h.startsWith('#')) h = h.substring(1);
-    if (!h) return null;
+  function getBParamFromHash(rawHash) {
+    return getParamFromHash(rawHash, 'b');
+  }
 
-    const parts = h.split('&');
-    for (const part of parts) {
-      const [k, v] = part.split('=');
-      if (k === 'r') {
-        return v ? decodeURIComponent(v) : '';
-      }
-    }
-    return null;
+  function getRParamFromHash(rawHash) {
+    return getParamFromHash(rawHash, 'r');
   }
 
   function base64ToBytes(b64) {
@@ -179,58 +173,78 @@
     return bytes;
   }
 
-  // NOWA wersja – stała siatka slotów: po nagłówku same pary [T1enc, T2enc]
+  // Dekoder payloadu:
+  //  [0] = rok-2000
+  //  [1] = miesiac
+  //  [2] = dzien
+  //  [3] = interwal_min
+  //  dalej:
+  //   - wariant 1 (obecny):  slotsPerDay bajtow T1
+  //   - wariant 2 (przyszly): slotsPerDay T1 + slotsPerDay T2
   function decodePayload(bytes) {
-    if (!bytes || bytes.length < 4) {
-      throw new Error('Za mało danych (nagłówek krótszy niż 4 bajty).');
+    if (!bytes || bytes.length < 5) {
+      throw new Error('Za mało danych (nagłówek + przynajmniej 1 slot).');
     }
 
-    const yearOff = bytes[0];
-    const year    = 2000 + yearOff;
-    const month   = bytes[1];
-    const day     = bytes[2];
+    const yearOff    = bytes[0];
+    const year       = 2000 + yearOff;
+    const month      = bytes[1];
+    const day        = bytes[2];
     const intervalMin = bytes[3];
 
     if (intervalMin === 0) {
       throw new Error('Interwał = 0 w nagłówku.');
     }
-    if (60 % intervalMin !== 0 || 1440 % intervalMin !== 0) {
-      throw new Error('Interwał z nagłówka nie dzieli 60/1440.');
+    if (1440 % intervalMin !== 0) {
+      throw new Error('Interwał z nagłówka nie dzieli 1440.');
     }
 
-    const totalSlotsPerDay = 1440 / intervalMin;
-    const dataBytes = bytes.length - 4;
+    const slotsPerDay = 1440 / intervalMin;
+    const dataOffset  = 4;
+    const remain      = bytes.length - dataOffset;
 
-    if (dataBytes < totalSlotsPerDay * 2) {
-      throw new Error('Za mało danych w payloadzie względem interwału.');
+    if (remain < slotsPerDay) {
+      throw new Error('Za mało danych w payloadzie (mniej niż slotsPerDay).');
     }
 
+    // Czy mamy również T2?
+    const hasT2 = (remain >= 2 * slotsPerDay);
     const samples = [];
 
-    // SLOT = indeks (0..slots-1), czas = slot * interwał
-    for (let slot = 0; slot < totalSlotsPerDay; slot++) {
-      const idx = 4 + slot * 2;
-      const t1Enc = bytes[idx];
-      const t2Enc = bytes[idx + 1];
+    for (let i = 0; i < slotsPerDay; i++) {
+      const encT1 = bytes[dataOffset + i];
+      let encT2 = 0xFF;
+      if (hasT2) {
+        encT2 = bytes[dataOffset + slotsPerDay + i];
+      }
 
-      // 0xFF,0xFF = brak danych
-      if (t1Enc === 0xFF && t2Enc === 0xFF) {
+      // obliczamy czas slotu
+      const minutesFromMidnight = i * intervalMin;
+      const hour   = Math.floor(minutesFromMidnight / 60);
+      const minute = minutesFromMidnight % 60;
+
+      // brak jakichkolwiek danych w slocie
+      if (encT1 === 0xFF && encT2 === 0xFF) {
         continue;
       }
 
-      const minutes = slot * intervalMin;
-      const hour = Math.floor(minutes / 60);
-      const minute = minutes % 60;
+      let t1 = null;
+      let t2 = null;
 
-      const t1 = t1Enc - 40;
-      const t2 = t2Enc - 40;
+      if (encT1 !== 0xFF) {
+        t1 = encT1 - 40;
+      }
+      if (encT2 !== 0xFF) {
+        t2 = encT2 - 40;
+      }
 
       samples.push({ hour, minute, t1, t2 });
     }
 
     samples.sort((a, b) => {
-      if (a.hour !== b.hour) return a.hour - b.hour;
-      return a.minute - b.minute;
+      const ta = a.hour * 60 + a.minute;
+      const tb = b.hour * 60 + b.minute;
+      return ta - tb;
     });
 
     return {
@@ -263,11 +277,14 @@
 
     data.samples.forEach((s, idx) => {
       const timeStr = pad2(s.hour) + ':' + pad2(s.minute);
+      const t1Str = (s.t1 === null || s.t1 === undefined) ? '–' : s.t1;
+      const t2Str = (s.t2 === null || s.t2 === undefined) ? '–' : s.t2; // miejsce na druga czujke
+
       html += '<tr>' +
         '<td>' + (idx + 1) + '</td>' +
         '<td>' + timeStr + '</td>' +
-        '<td>' + s.t1 + '</td>' +
-        '<td>' + s.t2 + '</td>' +
+        '<td>' + t1Str + '</td>' +
+        '<td>' + t2Str + '</td>' +
         '</tr>';
     });
 
