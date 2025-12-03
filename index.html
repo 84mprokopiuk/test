@@ -82,6 +82,10 @@
       font-size: 0.8rem;
       color: #555;
     }
+    .approx {
+      color: #555;
+      font-style: italic;
+    }
   </style>
 </head>
 <body>
@@ -89,16 +93,18 @@
   <div class="card">
     <h1>Log temperatury z QR</h1>
     <div class="info-row small">
-      Dane są przesyłane w formacie binarnym.
-      Aktualnie QR zawiera T1 w równych odstępach czasu (np. co 15 minut).
-      Miejsce na T2 jest przygotowane na przyszłość.
+      Dane są przesyłane w formacie binarnym (1 próbka na godzinę, T1/T2 zaokrąglone do 1&nbsp;°C).
+    </div>
+    <div class="info-row small">
+      Na stronie pokazujemy siatkę co 15 minut. Wpisy pomiędzy godzinami są szacowane
+      (~) tylko wtedy, gdy różnica między kolejnymi godzinami nie przekracza 2&nbsp;°C.
     </div>
   </div>
 
   <div class="card">
     <h2>Źródło danych</h2>
     <div class="controls">
-      <input id="hashInput" type="text" placeholder="#b=...&r=..." />
+      <input id="hashInput" type="text" placeholder="#b=..." />
       <button id="btnLoadHash">Załaduj z pola</button>
     </div>
     <div class="small">
@@ -112,12 +118,12 @@
     <h2>Informacje o logu</h2>
     <div class="info-row"><span class="info-label">Data:</span> <span id="infoDate">–</span></div>
     <div class="info-row"><span class="info-label">Rejestracja:</span> <span id="infoRej">–</span></div>
-    <div class="info-row"><span class="info-label">Interwał logu:</span> <span id="infoInterval">–</span></div>
-    <div class="info-row"><span class="info-label">Próbek w QR:</span> <span id="infoSamples">–</span></div>
+    <div class="info-row"><span class="info-label">Interwał oryginalnego logu:</span> <span id="infoInterval">–</span></div>
+    <div class="info-row"><span class="info-label">Próbek w QR (godzinowych):</span> <span id="infoSamples">–</span></div>
   </div>
 
   <div class="card">
-    <h2>Tabela temperatur</h2>
+    <h2>Tabela temperatur (co 15 min)</h2>
     <div id="tableContainer">
       Brak danych – zeskanuj QR lub wklej adres z fragmentem <code>#b=...</code>.
     </div>
@@ -139,7 +145,7 @@
       'Brak danych – zeskanuj QR lub wklej adres z fragmentem <code>#b=...</code>.';
   }
 
-  function getParamFromHash(rawHash, key) {
+  function getBParamFromHash(rawHash) {
     if (!rawHash) return null;
     let h = rawHash;
     if (h.startsWith('#')) h = h.substring(1);
@@ -148,19 +154,27 @@
     const parts = h.split('&');
     for (const part of parts) {
       const [k, v] = part.split('=');
-      if (k === key) {
+      if (k === 'b') {
         return v ? decodeURIComponent(v) : '';
       }
     }
     return null;
   }
 
-  function getBParamFromHash(rawHash) {
-    return getParamFromHash(rawHash, 'b');
-  }
-
   function getRParamFromHash(rawHash) {
-    return getParamFromHash(rawHash, 'r');
+    if (!rawHash) return null;
+    let h = rawHash;
+    if (h.startsWith('#')) h = h.substring(1);
+    if (!h) return null;
+
+    const parts = h.split('&');
+    for (const part of parts) {
+      const [k, v] = part.split('=');
+      if (k === 'r') {
+        return v ? decodeURIComponent(v) : '';
+      }
+    }
+    return null;
   }
 
   function base64ToBytes(b64) {
@@ -173,70 +187,44 @@
     return bytes;
   }
 
-  // Dekoder payloadu:
-  //  [0] = rok-2000
-  //  [1] = miesiac
-  //  [2] = dzien
-  //  [3] = interwal_min
-  //  dalej:
-  //   - wariant 1 (obecny):  slotsPerDay bajtow T1
-  //   - wariant 2 (przyszly): slotsPerDay T1 + slotsPerDay T2
   function decodePayload(bytes) {
-    if (!bytes || bytes.length < 5) {
-      throw new Error('Za mało danych (nagłówek + przynajmniej 1 slot).');
+    if (!bytes || bytes.length < 4) {
+      throw new Error('Za mało danych (nagłówek krótszy niż 4 bajty).');
     }
 
-    const yearOff    = bytes[0];
-    const year       = 2000 + yearOff;
-    const month      = bytes[1];
-    const day        = bytes[2];
+    const yearOff = bytes[0];
+    const year    = 2000 + yearOff;
+    const month   = bytes[1];
+    const day     = bytes[2];
     const intervalMin = bytes[3];
 
     if (intervalMin === 0) {
       throw new Error('Interwał = 0 w nagłówku.');
     }
-    if (1440 % intervalMin !== 0) {
-      throw new Error('Interwał z nagłówka nie dzieli 1440.');
+    if (60 % intervalMin !== 0) {
+      throw new Error('Interwał z nagłówka nie dzieli 60.');
     }
 
-    const slotsPerDay = 1440 / intervalMin;
-    const dataOffset  = 4;
-    const remain      = bytes.length - dataOffset;
-
-    if (remain < slotsPerDay) {
-      throw new Error('Za mało danych w payloadzie (mniej niż slotsPerDay).');
-    }
-
-    // Czy mamy również T2?
-    const hasT2 = (remain >= 2 * slotsPerDay);
+    const slotsPerHour = 60 / intervalMin;
     const samples = [];
 
-    for (let i = 0; i < slotsPerDay; i++) {
-      const encT1 = bytes[dataOffset + i];
-      let encT2 = 0xFF;
-      if (hasT2) {
-        encT2 = bytes[dataOffset + slotsPerDay + i];
-      }
+    let i = 4;
+    while (i + 2 < bytes.length) {
+      const slot  = bytes[i++];
+      const t1Enc = bytes[i++];
+      const t2Enc = bytes[i++];
 
-      // obliczamy czas slotu
-      const minutesFromMidnight = i * intervalMin;
-      const hour   = Math.floor(minutesFromMidnight / 60);
-      const minute = minutesFromMidnight % 60;
-
-      // brak jakichkolwiek danych w slocie
-      if (encT1 === 0xFF && encT2 === 0xFF) {
+      const totalSlotsPerDay = 1440 / intervalMin;
+      if (slot >= totalSlotsPerDay) {
         continue;
       }
 
-      let t1 = null;
-      let t2 = null;
+      const hour   = Math.floor(slot / slotsPerHour);
+      const within = slot % slotsPerHour;
+      const minute = within * intervalMin;
 
-      if (encT1 !== 0xFF) {
-        t1 = encT1 - 40;
-      }
-      if (encT2 !== 0xFF) {
-        t2 = encT2 - 40;
-      }
+      const t1 = t1Enc - 40;
+      const t2 = t2Enc - 40;
 
       samples.push({ hour, minute, t1, t2 });
     }
@@ -260,6 +248,111 @@
     return n < 10 ? '0' + n : '' + n;
   }
 
+  // Rozszerzenie godzinowych próbek do siatki co baseIntervalMin (np. 15 min)
+  // z progowym wypełnianiem (~) gdy |ΔT1| <= thresholdC.
+  function expandToGrid(data, baseIntervalMin, thresholdC) {
+    const samples = data.samples || [];
+    if (!samples.length) return [];
+
+    // Mapowanie "czas w minutach" -> próbka
+    const exactMap = {};
+    const exactTimes = [];
+    for (const s of samples) {
+      const t = s.hour * 60 + s.minute;
+      exactMap[t] = s;
+      exactTimes.push(t);
+    }
+    exactTimes.sort((a, b) => a - b);
+
+    const firstTime = exactTimes[0];
+    const lastTime  = exactTimes[exactTimes.length - 1];
+
+    const grid = [];
+
+    // pomocnicze: znajdź poprzednią i następną dokładną próbkę
+    function findPrevNext(t) {
+      let prev = null;
+      let next = null;
+      for (let i = 0; i < exactTimes.length; i++) {
+        const tt = exactTimes[i];
+        if (tt <= t) prev = tt;
+        if (tt >= t) {
+          next = tt;
+          break;
+        }
+      }
+      return { prev, next };
+    }
+
+    for (let t = firstTime; t <= lastTime; t += baseIntervalMin) {
+      const hour = Math.floor(t / 60);
+      const minute = t % 60;
+
+      if (exactMap.hasOwnProperty(t)) {
+        const s = exactMap[t];
+        grid.push({
+          hour,
+          minute,
+          t1: s.t1,
+          t2: s.t2,
+          exact: true,
+          approx: false
+        });
+      } else {
+        const { prev, next } = findPrevNext(t);
+        if (prev === null || next === null || prev === next) {
+          // Nie ma pełnych sąsiadów – brak danych
+          grid.push({
+            hour,
+            minute,
+            t1: null,
+            t2: null,
+            exact: false,
+            approx: false
+          });
+        } else {
+          const sPrev = exactMap[prev];
+          const sNext = exactMap[next];
+          const dT1 = sNext.t1 - sPrev.t1;
+          const dT2 = sNext.t2 - sPrev.t2;
+
+          if (Math.abs(dT1) > thresholdC) {
+            // Zbyt duży skok -> nie udajemy dokładności
+            grid.push({
+              hour,
+              minute,
+              t1: null,
+              t2: null,
+              exact: false,
+              approx: false
+            });
+          } else {
+            const ratio = (t - prev) / (next - prev);
+            const t1 = sPrev.t1 + dT1 * ratio;
+            const t2 = sPrev.t2 + dT2 * ratio;
+
+            grid.push({
+              hour,
+              minute,
+              t1,
+              t2,
+              exact: false,
+              approx: true
+            });
+          }
+        }
+      }
+    }
+
+    return grid;
+  }
+
+  function formatTemp(val, isApprox) {
+    if (val === null || Number.isNaN(val)) return '–';
+    const s = val.toFixed(1);
+    return isApprox ? s + ' ~' : s;
+  }
+
   function renderData(data) {
     const dateStr = pad2(data.day) + '.' + pad2(data.month) + '.' + data.year;
     document.getElementById('infoDate').textContent = dateStr;
@@ -271,20 +364,31 @@
       return;
     }
 
+    // Zakładamy, że logger pracuje z interwałem z nagłówka (np. 15 min)
+    const baseIntervalMin = data.intervalMin || 15;
+    const thresholdC = 2.0; // próg 2°C
+
+    const grid = expandToGrid(data, baseIntervalMin, thresholdC);
+
+    if (!grid.length) {
+      document.getElementById('tableContainer').innerHTML = 'Brak próbek do wyświetlenia.';
+      return;
+    }
+
     let html = '<table><thead><tr>' +
       '<th>Lp</th><th>Czas</th><th>T1 [°C]</th><th>T2 [°C]</th>' +
       '</tr></thead><tbody>';
 
-    data.samples.forEach((s, idx) => {
-      const timeStr = pad2(s.hour) + ':' + pad2(s.minute);
-      const t1Str = (s.t1 === null || s.t1 === undefined) ? '–' : s.t1;
-      const t2Str = (s.t2 === null || s.t2 === undefined) ? '–' : s.t2; // miejsce na druga czujke
+    grid.forEach((row, idx) => {
+      const timeStr = pad2(row.hour) + ':' + pad2(row.minute);
+      const isApprox = row.approx && !row.exact;
+      const rowClass = isApprox ? ' class="approx"' : '';
 
-      html += '<tr>' +
+      html += '<tr' + rowClass + '>' +
         '<td>' + (idx + 1) + '</td>' +
-        '<td>' + timeStr + '</td>' +
-        '<td>' + t1Str + '</td>' +
-        '<td>' + t2Str + '</td>' +
+        '<td>' + timeStr + (isApprox ? ' ~' : '') + '</td>' +
+        '<td>' + formatTemp(row.t1, isApprox) + '</td>' +
+        '<td>' + formatTemp(row.t2, isApprox) + '</td>' +
         '</tr>';
     });
 
