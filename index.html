@@ -82,10 +82,6 @@
       font-size: 0.8rem;
       color: #555;
     }
-    .approx {
-      color: #555;
-      font-style: italic;
-    }
   </style>
 </head>
 <body>
@@ -93,11 +89,8 @@
   <div class="card">
     <h1>Log temperatury z QR</h1>
     <div class="info-row small">
-      Dane są przesyłane w formacie binarnym (1 próbka na godzinę, T1/T2 zaokrąglone do 1&nbsp;°C).
-    </div>
-    <div class="info-row small">
-      Na stronie pokazujemy siatkę co 15 minut. Wpisy pomiędzy godzinami są szacowane
-      (~) tylko wtedy, gdy różnica między kolejnymi godzinami nie przekracza 2&nbsp;°C.
+      Dane w QR zawierają punkty bazowe (co 1&nbsp;h) i wybrane punkty alarmowe.
+      Tabela poniżej pokazuje przebieg co 15&nbsp;min.
     </div>
   </div>
 
@@ -118,8 +111,8 @@
     <h2>Informacje o logu</h2>
     <div class="info-row"><span class="info-label">Data:</span> <span id="infoDate">–</span></div>
     <div class="info-row"><span class="info-label">Rejestracja:</span> <span id="infoRej">–</span></div>
-    <div class="info-row"><span class="info-label">Interwał oryginalnego logu:</span> <span id="infoInterval">–</span></div>
-    <div class="info-row"><span class="info-label">Próbek w QR (godzinowych):</span> <span id="infoSamples">–</span></div>
+    <div class="info-row"><span class="info-label">Interwał logu:</span> <span id="infoInterval">–</span></div>
+    <div class="info-row"><span class="info-label">Próbek w QR (baza+alarmy):</span> <span id="infoSamples">–</span></div>
   </div>
 
   <div class="card">
@@ -187,25 +180,30 @@
     return bytes;
   }
 
+  // Dekoduje payload z ESP:
+  // [0] = rok-2000, [1] = miesiac, [2] = dzien, [3] = interwal (np. 15)
+  // dalej powtarza sie: [slot][T1enc][T2enc]
   function decodePayload(bytes) {
     if (!bytes || bytes.length < 4) {
       throw new Error('Za mało danych (nagłówek krótszy niż 4 bajty).');
     }
 
-    const yearOff = bytes[0];
-    const year    = 2000 + yearOff;
-    const month   = bytes[1];
-    const day     = bytes[2];
+    const yearOff    = bytes[0];
+    const year       = 2000 + yearOff;
+    const month      = bytes[1];
+    const day        = bytes[2];
     const intervalMin = bytes[3];
 
     if (intervalMin === 0) {
       throw new Error('Interwał = 0 w nagłówku.');
     }
-    if (60 % intervalMin !== 0) {
-      throw new Error('Interwał z nagłówka nie dzieli 60.');
+    if (60 % intervalMin !== 0 || 1440 % intervalMin !== 0) {
+      throw new Error('Interwał z nagłówka nie dzieli 60/1440.');
     }
 
     const slotsPerHour = 60 / intervalMin;
+    const totalSlotsPerDay = 1440 / intervalMin;
+
     const samples = [];
 
     let i = 4;
@@ -214,7 +212,6 @@
       const t1Enc = bytes[i++];
       const t2Enc = bytes[i++];
 
-      const totalSlotsPerDay = 1440 / intervalMin;
       if (slot >= totalSlotsPerDay) {
         continue;
       }
@@ -226,21 +223,19 @@
       const t1 = t1Enc - 40;
       const t2 = t2Enc - 40;
 
-      samples.push({ hour, minute, t1, t2 });
+      samples.push({ slot, hour, minute, t1, t2 });
     }
 
-    samples.sort((a, b) => {
-      const ta = a.hour * 60 + a.minute;
-      const tb = b.hour * 60 + b.minute;
-      return ta - tb;
-    });
+    // sort po slocie (czas rosnąco)
+    samples.sort((a, b) => a.slot - b.slot);
 
     return {
       year,
       month,
       day,
       intervalMin,
-      samples
+      samples,
+      totalSlotsPerDay
     };
   }
 
@@ -248,109 +243,90 @@
     return n < 10 ? '0' + n : '' + n;
   }
 
-  // Rozszerzenie godzinowych próbek do siatki co baseIntervalMin (np. 15 min)
-  // z progowym wypełnianiem (~) gdy |ΔT1| <= thresholdC.
-  function expandToGrid(data, baseIntervalMin, thresholdC) {
-    const samples = data.samples || [];
-    if (!samples.length) return [];
+  // Buduje pełną siatkę co intervalMin (np. 96 punktów dla 15 min)
+  // z interpolacją liniową między próbkami z QR (ukrytą).
+  function buildFullGrid(data) {
+    const interval = data.intervalMin;
+    const totalSlots = data.totalSlotsPerDay;
+    const realBySlot = new Array(totalSlots).fill(null);
 
-    // Mapowanie "czas w minutach" -> próbka
-    const exactMap = {};
-    const exactTimes = [];
-    for (const s of samples) {
-      const t = s.hour * 60 + s.minute;
-      exactMap[t] = s;
-      exactTimes.push(t);
+    // wrzucamy realne próbki (bazowe + alarmowe) do tablicy wg slotu
+    data.samples.forEach(s => {
+      if (s.slot >= 0 && s.slot < totalSlots) {
+        realBySlot[s.slot] = { t1: s.t1, t2: s.t2 };
+      }
+    });
+
+    // tablica poprzednich i następnych realnych slotów
+    const prevIdx = new Array(totalSlots).fill(-1);
+    const nextIdx = new Array(totalSlots).fill(-1);
+
+    let last = -1;
+    for (let i = 0; i < totalSlots; ++i) {
+      if (realBySlot[i]) last = i;
+      prevIdx[i] = last;
     }
-    exactTimes.sort((a, b) => a - b);
 
-    const firstTime = exactTimes[0];
-    const lastTime  = exactTimes[exactTimes.length - 1];
+    last = -1;
+    for (let i = totalSlots - 1; i >= 0; --i) {
+      if (realBySlot[i]) last = i;
+      nextIdx[i] = last;
+    }
 
     const grid = [];
 
-    // pomocnicze: znajdź poprzednią i następną dokładną próbkę
-    function findPrevNext(t) {
-      let prev = null;
-      let next = null;
-      for (let i = 0; i < exactTimes.length; i++) {
-        const tt = exactTimes[i];
-        if (tt <= t) prev = tt;
-        if (tt >= t) {
-          next = tt;
-          break;
-        }
-      }
-      return { prev, next };
-    }
+    for (let slot = 0; slot < totalSlots; ++slot) {
+      const totalMinutes = slot * interval;
+      const hour = Math.floor(totalMinutes / 60);
+      const minute = totalMinutes % 60;
 
-    for (let t = firstTime; t <= lastTime; t += baseIntervalMin) {
-      const hour = Math.floor(t / 60);
-      const minute = t % 60;
+      let t1, t2;
 
-      if (exactMap.hasOwnProperty(t)) {
-        const s = exactMap[t];
-        grid.push({
-          hour,
-          minute,
-          t1: s.t1,
-          t2: s.t2,
-          exact: true,
-          approx: false
-        });
+      if (realBySlot[slot]) {
+        // realny punkt z QR
+        t1 = realBySlot[slot].t1;
+        t2 = realBySlot[slot].t2;
       } else {
-        const { prev, next } = findPrevNext(t);
-        if (prev === null || next === null || prev === next) {
-          // Nie ma pełnych sąsiadów – brak danych
-          grid.push({
-            hour,
-            minute,
-            t1: null,
-            t2: null,
-            exact: false,
-            approx: false
-          });
+        const p = prevIdx[slot];
+        const n = nextIdx[slot];
+
+        if (p === -1 && n === -1) {
+          // brak jakichkolwiek danych – teoretycznie nie powinno sie zdarzyc
+          continue;
+        } else if (p === -1) {
+          // tylko następny – kopiujemy
+          t1 = realBySlot[n].t1;
+          t2 = realBySlot[n].t2;
+        } else if (n === -1) {
+          // tylko poprzedni – kopiujemy
+          t1 = realBySlot[p].t1;
+          t2 = realBySlot[p].t2;
         } else {
-          const sPrev = exactMap[prev];
-          const sNext = exactMap[next];
-          const dT1 = sNext.t1 - sPrev.t1;
-          const dT2 = sNext.t2 - sPrev.t2;
+          // interpolacja liniowa
+          const span = n - p;
+          const pos  = slot - p;
+          const w    = span === 0 ? 0 : (pos / span);
 
-          if (Math.abs(dT1) > thresholdC) {
-            // Zbyt duży skok -> nie udajemy dokładności
-            grid.push({
-              hour,
-              minute,
-              t1: null,
-              t2: null,
-              exact: false,
-              approx: false
-            });
-          } else {
-            const ratio = (t - prev) / (next - prev);
-            const t1 = sPrev.t1 + dT1 * ratio;
-            const t2 = sPrev.t2 + dT2 * ratio;
+          const t1p = realBySlot[p].t1;
+          const t1n = realBySlot[n].t1;
+          const t2p = realBySlot[p].t2;
+          const t2n = realBySlot[n].t2;
 
-            grid.push({
-              hour,
-              minute,
-              t1,
-              t2,
-              exact: false,
-              approx: true
-            });
-          }
+          t1 = t1p + (t1n - t1p) * w;
+          t2 = t2p + (t2n - t2p) * w;
         }
       }
+
+      grid.push({
+        slot,
+        hour,
+        minute,
+        t1,
+        t2
+      });
     }
 
     return grid;
-  }
-
-  function formatTemp(val, isApprox) {
-    if (val === null || Number.isNaN(val)) return '–';
-    const s = val.toFixed(1);
-    return isApprox ? s + ' ~' : s;
   }
 
   function renderData(data) {
@@ -359,19 +335,10 @@
     document.getElementById('infoInterval').textContent = data.intervalMin + ' min';
     document.getElementById('infoSamples').textContent = data.samples.length;
 
-    if (!data.samples.length) {
-      document.getElementById('tableContainer').innerHTML = 'Brak próbek w danych QR.';
-      return;
-    }
-
-    // Zakładamy, że logger pracuje z interwałem z nagłówka (np. 15 min)
-    const baseIntervalMin = data.intervalMin || 15;
-    const thresholdC = 2.0; // próg 2°C
-
-    const grid = expandToGrid(data, baseIntervalMin, thresholdC);
+    const grid = buildFullGrid(data);
 
     if (!grid.length) {
-      document.getElementById('tableContainer').innerHTML = 'Brak próbek do wyświetlenia.';
+      document.getElementById('tableContainer').innerHTML = 'Brak próbek w danych QR.';
       return;
     }
 
@@ -381,14 +348,14 @@
 
     grid.forEach((row, idx) => {
       const timeStr = pad2(row.hour) + ':' + pad2(row.minute);
-      const isApprox = row.approx && !row.exact;
-      const rowClass = isApprox ? ' class="approx"' : '';
+      const t1Str = (row.t1 !== null && row.t1 !== undefined) ? row.t1.toFixed(1) : '–';
+      const t2Str = (row.t2 !== null && row.t2 !== undefined) ? row.t2.toFixed(1) : '–';
 
-      html += '<tr' + rowClass + '>' +
+      html += '<tr>' +
         '<td>' + (idx + 1) + '</td>' +
-        '<td>' + timeStr + (isApprox ? ' ~' : '') + '</td>' +
-        '<td>' + formatTemp(row.t1, isApprox) + '</td>' +
-        '<td>' + formatTemp(row.t2, isApprox) + '</td>' +
+        '<td>' + timeStr + '</td>' +
+        '<td>' + t1Str + '</td>' +
+        '<td>' + t2Str + '</td>' +
         '</tr>';
     });
 
